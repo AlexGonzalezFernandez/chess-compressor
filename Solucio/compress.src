@@ -19,11 +19,13 @@ import array
 MAGIC = b"CDI1"
 FORMAT_VERSION = 1
 
-# Modes de compressio. De moment nomes faig servir el 1.
-MODE_IDENTITY    = 0
-MODE_ARITH_BYTES = 1
+# Modes de compressio.
+MODE_IDENTITY    = 0   # copia literal, per debug
+MODE_ARITH_BYTES = 1   # range coder + model ordre-2 sobre tot el fitxer
+MODE_SPLIT       = 2   # separa capçaleres i movetext, cada stream al seu RC
+MODE_SEMANTIC    = 3   # parser semantic dels tags
 
-DEFAULT_MODE = MODE_ARITH_BYTES
+DEFAULT_MODE = MODE_SEMANTIC
 
 
 # --- Identity (nomes per debugar) -----------------------------------------
@@ -489,11 +491,669 @@ def decompress_arith_bytes(payload):
     return bytes(out)
 
 
-# --- Embolcall del fitxer comprimit ---------------------------------------
+# --- Parser PGN: separa capçaleres i movetext ------------------------------
+#
+# Els fitxers de test segueixen un format molt regular:
+#
+#   [Tag "Valor"]
+#   [Tag "Valor"]
+#   ...
+#
+#   1. e4 e5 2. Nf3 ... 1-0
+#
+#   [Tag "Valor"]
+#   ...
+#
+# Es a dir, les partides estan separades per una linia buida, i dins de
+# cada partida els tags i el movetext tambe estan separats per una linia
+# buida. Els fitxers acaben sempre amb "<resultat>\n" (sense \n\n final).
+#
+# El parser aprofita que el separador entre partides es el "\n\n" i no
+# apareix ni dins dels tags ni dins del movetext (ho he comprovat sobre
+# els 7 fitxers de test). El movetext pot contenir UN sol \n en alguna
+# partida llarga que Lichess parteix al voltant dels 80 caracters, pero
+# mai dos seguits.
+#
+# Si apareguessin fitxers no canonics (per exemple amb \r\n, o amb
+# partides sense tags, o amb espais al final), l'split per \n\n no
+# donaria el resultat esperat. Com a xarxa de seguretat, si el parser
+# detecta alguna cosa rara tornem al mode MODE_ARITH_BYTES: el fitxer
+# es comprimeix igual, pero amb una ratio lleugerament pitjor.
+
+# Byte delimitador entre partides dins dels streams. Qualsevol byte que
+# no aparegui al fitxer original ni als markers semantics ens val. Els
+# fitxers PGN fan servir nomes bytes 10..125 i els markers 0x01..0x03 els
+# faig servir per comentaris d'eval, aixi que el 0x04 es segur.
+_SEP = b'\x04'
+
+
+def _try_split_pgn(data):
+    # Retorna (llista_headers, llista_movetexts) si el fitxer segueix
+    # l'estructura canonica que explota aquest mode. Retorna None si no
+    # hi encaixa.
+    if b'\r' in data:
+        return None
+    if not data.endswith(b'\n'):
+        return None
+    if b'\n\n\n' in data:
+        # Tres salts seguits no haurien d'apareixer
+        return None
+
+    # Normalitzo: despres de l'ultim movetext hi ha un sol \n i no \n\n,
+    # pero per simplicitat afegeixo un \n mes (i el trauré en descompressio).
+    # Aixi puc dividir uniformement per \n\n.
+    blocks = (data + b'\n').split(b'\n\n')
+    # L'ultim bloc ha de ser buit
+    if blocks[-1] != b'':
+        return None
+    blocks = blocks[:-1]
+    if len(blocks) % 2 != 0:
+        return None
+
+    headers    = []
+    movetexts  = []
+    for i, b in enumerate(blocks):
+        if i % 2 == 0:
+            # Bloc de tags: ha de començar amb '[' i acabar amb ']'
+            if not (b.startswith(b'[') and b.endswith(b']')):
+                return None
+            headers.append(b)
+        else:
+            # Bloc de movetext: ha d'acabar amb un dels 4 resultats
+            if not (b.endswith(b'1-0') or b.endswith(b'0-1')
+                    or b.endswith(b'1/2-1/2') or b.endswith(b'*')):
+                return None
+            movetexts.append(b)
+
+    if len(headers) != len(movetexts):
+        return None
+    return headers, movetexts
+
+
+def _assemble_pgn(headers, movetexts):
+    parts = []
+    for i, (h, m) in enumerate(zip(headers, movetexts)):
+        parts.append(h)
+        parts.append(b'\n\n')
+        parts.append(m)
+        if i < len(headers) - 1:
+            parts.append(b'\n\n')
+        else:
+            parts.append(b'\n')
+    return b''.join(parts)
+
+
+def compress_split(data):
+    parsed = _try_split_pgn(data)
+    if parsed is None:
+        # Fallback: marca que no s'ha pogut separar i fa el mode generic.
+        # 1 byte de flag + stream generic.
+        return b'\x00' + compress_arith_bytes(data)
+
+    headers, movetexts = parsed
+    stream_h = _SEP.join(headers)
+    stream_m = _SEP.join(movetexts)
+
+    enc_h = compress_arith_bytes(stream_h)
+    enc_m = compress_arith_bytes(stream_m)
+
+    # flag=1 + 4 bytes amb la longitud del primer stream comprimit + els dos
+    return (b'\x01'
+            + len(enc_h).to_bytes(4, 'big')
+            + enc_h
+            + enc_m)
+
+
+def decompress_split(payload):
+    flag = payload[0]
+    if flag == 0x00:
+        return decompress_arith_bytes(payload[1:])
+
+    len_h = int.from_bytes(payload[1:5], 'big')
+    enc_h = payload[5:5 + len_h]
+    enc_m = payload[5 + len_h:]
+
+    stream_h = decompress_arith_bytes(enc_h)
+    stream_m = decompress_arith_bytes(enc_m)
+
+    headers   = stream_h.split(_SEP)
+    movetexts = stream_m.split(_SEP)
+    return _assemble_pgn(headers, movetexts)
+
+
+# --- Mode semantic: parsing dels tags ------------------------------------
+#
+# Objectiu: en comptes de comprimir els tags com a text, els parsegem i
+# convertim a una representacio binaria mes compacta abans de passar-los
+# pel range coder. El RC s'encarrega de squeeze la redundancia restant.
+#
+# Estructura d'una partida canonica: 17 tags possibles en ordre fix. Els
+# 13 primers son obligatoris, els 4 opcionals (RatingDiff i Title per
+# jugador) poden o no apareixer. Per cada partida emeto:
+#
+#   1. un byte de flags: bit i indica si el tag opcional i-esim hi es.
+#   2. els valors dels tags, en ordre canonic, amb una codificacio
+#      especifica per tag (data com 3 bytes, ELO com uint16, etc.)
+#
+# Si una partida no encaixa al format canonic observat als tests, fem
+# fallback: la tornem a serialitzar com a text i l'emetem plana al
+# stream (amb un marcador 0xFE).
+
+_CANONICAL_TAGS = (
+    'Event', 'Site', 'White', 'Black', 'Result',
+    'UTCDate', 'UTCTime', 'WhiteElo', 'BlackElo',
+    'WhiteRatingDiff', 'BlackRatingDiff',
+    'WhiteTitle', 'BlackTitle',
+    'ECO', 'Opening', 'TimeControl', 'Termination',
+)
+
+_OPTIONAL_TAGS  = {'WhiteRatingDiff', 'BlackRatingDiff',
+                   'WhiteTitle', 'BlackTitle'}
+_OPTIONAL_ORDER = ('WhiteRatingDiff', 'BlackRatingDiff',
+                   'WhiteTitle', 'BlackTitle')
+
+_RESULTS      = (b'1-0', b'0-1', b'1/2-1/2', b'*')
+_TERMINATIONS = (b'Normal', b'Time forfeit', b'Abandoned', b'Rules infraction')
+_TITLES       = (b'GM', b'IM', b'FM', b'NM', b'LM', b'CM', b'WGM', b'WIM')
+_EVENT_SHORT  = (b'Rated Blitz game',
+                 b'Rated Classical game',
+                 b'Rated Bullet game',
+                 b'Rated UltraBullet game',
+                 b'Rated Rapid game',
+                 b'Rated Correspondence game')
+
+_SITE_PREFIX    = b'https://lichess.org/'
+_TOURNEY_PREFIX = b'Rated '
+_TOURNEY_MID    = b' tournament https://lichess.org/tournament/'
+_SWISS_MID      = b' swiss https://lichess.org/swiss/'
+_TOURNEY_CATS   = (b'Bullet', b'Blitz', b'Rapid', b'Classical',
+                   b'UltraBullet', b'Correspondence')
+
+
+def _parse_tags_block(block):
+    # Parsa un bloc de tags. Retorna dict{tag:val} si tot va be, None si no
+    # segueix l'estructura canonica.
+    result = {}
+    order  = []
+    for line in block.split(b'\n'):
+        if not (line.startswith(b'[') and line.endswith(b']')):
+            return None
+        inside = line[1:-1]
+        sp = inside.find(b' ')
+        if sp < 0:
+            return None
+        key = inside[:sp].decode('ascii', errors='replace')
+        val = inside[sp + 1:]
+        if not (val.startswith(b'"') and val.endswith(b'"')):
+            return None
+        result[key] = val[1:-1]
+        order.append(key)
+    # Ordre: ha de ser subset de _CANONICAL_TAGS en el mateix ordre
+    exp = [t for t in _CANONICAL_TAGS if t in result]
+    if order != exp:
+        return None
+    # Tags obligatoris han de ser-hi
+    for t in _CANONICAL_TAGS:
+        if t not in _OPTIONAL_TAGS and t not in result:
+            return None
+    return result
+
+
+# --- Primitives d'enteres i strings ---------------------------------------
+
+def _enc_varint(n):
+    # enter sense signe, 7 bits per byte, bit alt de continuacio
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _dec_varint(data, pos):
+    n = 0
+    shift = 0
+    while True:
+        b = data[pos]; pos += 1
+        n |= (b & 0x7F) << shift
+        if b < 0x80:
+            return n, pos
+        shift += 7
+
+
+def _enc_sint(n):
+    # enter amb signe via zigzag
+    if n >= 0:
+        z = n << 1
+    else:
+        z = ((-n) << 1) - 1
+    return _enc_varint(z)
+
+
+def _dec_sint(data, pos):
+    z, pos = _dec_varint(data, pos)
+    if z & 1:
+        return -((z + 1) >> 1), pos
+    return z >> 1, pos
+
+
+def _enc_str(b):
+    return _enc_varint(len(b)) + b
+
+
+def _dec_str(data, pos):
+    n, pos = _dec_varint(data, pos)
+    return data[pos:pos + n], pos + n
+
+
+# --- Codecs per tag -------------------------------------------------------
+
+def _enc_site(v):
+    if v.startswith(_SITE_PREFIX) and len(v) == len(_SITE_PREFIX) + 8:
+        return b'\x00' + v[-8:]
+    return b'\x01' + _enc_str(v)
+
+
+def _dec_site(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        return _SITE_PREFIX + data[pos:pos + 8], pos + 8
+    return _dec_str(data, pos)
+
+
+def _enc_event(v):
+    for i, s in enumerate(_EVENT_SHORT):
+        if v == s:
+            return bytes([i])
+    if v.startswith(_TOURNEY_PREFIX):
+        rest = v[len(_TOURNEY_PREFIX):]
+        for middle, code in ((_TOURNEY_MID, 0x80), (_SWISS_MID, 0x81)):
+            # middle comença amb ' ', que ja em menja el prefix
+            mt = middle[1:]
+            for ci, cat in enumerate(_TOURNEY_CATS):
+                if rest.startswith(cat + mt):
+                    tid = rest[len(cat) + len(mt):]
+                    if len(tid) == 8:
+                        return bytes([code, ci]) + tid
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_event(data, pos):
+    t = data[pos]; pos += 1
+    if t < len(_EVENT_SHORT):
+        return _EVENT_SHORT[t], pos
+    if t == 0x80 or t == 0x81:
+        ci = data[pos]; pos += 1
+        cat = _TOURNEY_CATS[ci]
+        tid = data[pos:pos + 8]; pos += 8
+        mid = _TOURNEY_MID if t == 0x80 else _SWISS_MID
+        return _TOURNEY_PREFIX + cat + mid[1:] + tid, pos
+    if t == 0xFF:
+        return _dec_str(data, pos)
+    raise ValueError("event tag desconegut: %d" % t)
+
+
+def _enc_result(v):
+    for i, r in enumerate(_RESULTS):
+        if v == r:
+            return bytes([i])
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_result(data, pos):
+    t = data[pos]; pos += 1
+    if t < len(_RESULTS):
+        return _RESULTS[t], pos
+    return _dec_str(data, pos)
+
+
+def _enc_termination(v):
+    for i, x in enumerate(_TERMINATIONS):
+        if v == x:
+            return bytes([i])
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_termination(data, pos):
+    t = data[pos]; pos += 1
+    if t < len(_TERMINATIONS):
+        return _TERMINATIONS[t], pos
+    return _dec_str(data, pos)
+
+
+def _enc_title(v):
+    for i, x in enumerate(_TITLES):
+        if v == x:
+            return bytes([i])
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_title(data, pos):
+    t = data[pos]; pos += 1
+    if t < len(_TITLES):
+        return _TITLES[t], pos
+    return _dec_str(data, pos)
+
+
+def _enc_date(v):
+    # YYYY.MM.DD  -> 3 bytes amb (year-1900, month, day)
+    if len(v) == 10 and v[4:5] == b'.' and v[7:8] == b'.':
+        try:
+            y = int(v[:4]); mo = int(v[5:7]); d = int(v[8:10])
+            packed = ((y - 1900) << 9) | (mo << 5) | d
+            return b'\x00' + packed.to_bytes(3, 'big')
+        except ValueError:
+            pass
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_date(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        p = int.from_bytes(data[pos:pos + 3], 'big'); pos += 3
+        d  = p & 0x1F
+        mo = (p >> 5) & 0x0F
+        y  = (p >> 9) + 1900
+        return b"%04d.%02d.%02d" % (y, mo, d), pos
+    return _dec_str(data, pos)
+
+
+def _enc_time(v):
+    # HH:MM:SS -> segons del dia en 3 bytes
+    if len(v) == 8 and v[2:3] == b':' and v[5:6] == b':':
+        try:
+            h = int(v[:2]); mi = int(v[3:5]); s = int(v[6:8])
+            secs = h * 3600 + mi * 60 + s
+            return b'\x00' + secs.to_bytes(3, 'big')
+        except ValueError:
+            pass
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_time(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        secs = int.from_bytes(data[pos:pos + 3], 'big'); pos += 3
+        h, rem = divmod(secs, 3600)
+        mi, s  = divmod(rem, 60)
+        return b"%02d:%02d:%02d" % (h, mi, s), pos
+    return _dec_str(data, pos)
+
+
+def _enc_elo(v):
+    try:
+        n = int(v)
+        if 0 <= n < 65536:
+            return b'\x00' + n.to_bytes(2, 'big')
+    except ValueError:
+        pass
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_elo(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        n = int.from_bytes(data[pos:pos + 2], 'big'); pos += 2
+        return str(n).encode('ascii'), pos
+    return _dec_str(data, pos)
+
+
+def _enc_rating_diff(v):
+    # format: +N, -N, o N
+    try:
+        s = v.decode('ascii')
+        if s.startswith('+'):
+            n = int(s[1:])
+        else:
+            n = int(s)
+        return b'\x00' + _enc_sint(n)
+    except (ValueError, UnicodeDecodeError):
+        pass
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_rating_diff(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        n, pos = _dec_sint(data, pos)
+        if n >= 0:
+            return b'+' + str(n).encode('ascii'), pos
+        return str(n).encode('ascii'), pos
+    return _dec_str(data, pos)
+
+
+def _enc_eco(v):
+    if (len(v) == 3 and b'A' <= v[:1] <= b'E'
+            and v[1:2].isdigit() and v[2:3].isdigit()):
+        letter = v[0] - ord('A')
+        num    = int(v[1:3])
+        packed = letter * 100 + num
+        return b'\x00' + packed.to_bytes(2, 'big')
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_eco(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        p = int.from_bytes(data[pos:pos + 2], 'big'); pos += 2
+        letter = p // 100
+        num    = p % 100
+        return bytes([ord('A') + letter]) + b"%02d" % num, pos
+    return _dec_str(data, pos)
+
+
+def _enc_timecontrol(v):
+    if v == b'-':
+        return b'\x01'
+    plus = v.find(b'+')
+    if plus > 0:
+        try:
+            a  = int(v[:plus])
+            b2 = int(v[plus + 1:])
+            return b'\x00' + _enc_varint(a) + _enc_varint(b2)
+        except ValueError:
+            pass
+    return b'\xFF' + _enc_str(v)
+
+
+def _dec_timecontrol(data, pos):
+    t = data[pos]; pos += 1
+    if t == 0x01:
+        return b'-', pos
+    if t == 0x00:
+        a, pos  = _dec_varint(data, pos)
+        b2, pos = _dec_varint(data, pos)
+        return str(a).encode('ascii') + b'+' + str(b2).encode('ascii'), pos
+    return _dec_str(data, pos)
+
+
+def _enc_string(v, dictstate=None):
+    # Amb diccionari intra-fitxer: si ja l'hem emes, emet index.
+    if dictstate is not None:
+        d, arr = dictstate
+        if v in d:
+            return b'\x00' + _enc_varint(d[v])
+        d[v] = len(arr)
+        arr.append(v)
+        return b'\x01' + _enc_str(v)
+    return b'\x01' + _enc_str(v)
+
+
+def _dec_string(data, pos, dictstate=None):
+    t = data[pos]; pos += 1
+    if t == 0x00:
+        idx, pos = _dec_varint(data, pos)
+        if dictstate is None:
+            raise ValueError("index a string sense diccionari")
+        return dictstate[1][idx], pos
+    # t == 0x01
+    v, pos = _dec_str(data, pos)
+    if dictstate is not None:
+        d, arr = dictstate
+        d[v] = len(arr)
+        arr.append(v)
+    return v, pos
+
+
+_TAG_CODECS = {
+    'Event':           (_enc_event,         _dec_event),
+    'Site':            (_enc_site,          _dec_site),
+    'White':           (_enc_string,        _dec_string),
+    'Black':           (_enc_string,        _dec_string),
+    'Result':          (_enc_result,        _dec_result),
+    'UTCDate':         (_enc_date,          _dec_date),
+    'UTCTime':         (_enc_time,          _dec_time),
+    'WhiteElo':        (_enc_elo,           _dec_elo),
+    'BlackElo':        (_enc_elo,           _dec_elo),
+    'WhiteRatingDiff': (_enc_rating_diff,   _dec_rating_diff),
+    'BlackRatingDiff': (_enc_rating_diff,   _dec_rating_diff),
+    'WhiteTitle':      (_enc_title,         _dec_title),
+    'BlackTitle':      (_enc_title,         _dec_title),
+    'ECO':             (_enc_eco,           _dec_eco),
+    'Opening':         (_enc_string,        _dec_string),
+    'TimeControl':     (_enc_timecontrol,   _dec_timecontrol),
+    'Termination':     (_enc_termination,   _dec_termination),
+}
+
+
+def _encode_game_headers(tags, dict_players, dict_openings):
+    flag = 0
+    for i, t in enumerate(_OPTIONAL_ORDER):
+        if t in tags:
+            flag |= (1 << i)
+    parts = [bytes([flag])]
+    for t in _CANONICAL_TAGS:
+        if t in _OPTIONAL_TAGS and not (flag & (1 << _OPTIONAL_ORDER.index(t))):
+            continue
+        v = tags[t]
+        if t in ('White', 'Black'):
+            parts.append(_enc_string(v, dict_players))
+        elif t == 'Opening':
+            parts.append(_enc_string(v, dict_openings))
+        else:
+            parts.append(_TAG_CODECS[t][0](v))
+    return b''.join(parts)
+
+
+def _decode_game_headers(data, pos, dict_players, dict_openings):
+    flag = data[pos]; pos += 1
+    opt_present = {t: bool(flag & (1 << i)) for i, t in enumerate(_OPTIONAL_ORDER)}
+    lines = []
+    for t in _CANONICAL_TAGS:
+        if t in _OPTIONAL_TAGS and not opt_present[t]:
+            continue
+        if t in ('White', 'Black'):
+            v, pos = _dec_string(data, pos, dict_players)
+        elif t == 'Opening':
+            v, pos = _dec_string(data, pos, dict_openings)
+        else:
+            v, pos = _TAG_CODECS[t][1](data, pos)
+        lines.append(b'[' + t.encode('ascii') + b' "' + v + b'"]')
+    return b'\n'.join(lines), pos
+
+
+def _encode_all_headers(headers_blocks):
+    out = bytearray()
+    dict_players  = ({}, [])   # (val->idx, llista_ordre)
+    dict_openings = ({}, [])
+    for h in headers_blocks:
+        parsed = _parse_tags_block(h)
+        if parsed is None:
+            out.append(0xFE)
+            out += _enc_str(h)
+        else:
+            out.append(0x01)
+            out += _encode_game_headers(parsed, dict_players, dict_openings)
+    return bytes(out)
+
+
+def _decode_all_headers(data, n_games):
+    headers = []
+    pos = 0
+    dict_players  = ({}, [])
+    dict_openings = ({}, [])
+    for _ in range(n_games):
+        t = data[pos]; pos += 1
+        if t == 0xFE:
+            v, pos = _dec_str(data, pos)
+            headers.append(v)
+        elif t == 0x01:
+            block, pos = _decode_game_headers(data, pos, dict_players, dict_openings)
+            headers.append(block)
+        else:
+            raise ValueError("header flag desconegut: %d" % t)
+    return headers
+
+
+def compress_semantic(data):
+    parsed = _try_split_pgn(data)
+    if parsed is None:
+        return b'\x00' + compress_arith_bytes(data)
+
+    headers, movetexts = parsed
+    sem_stream = _encode_all_headers(headers)
+    mov_stream = _encode_all_movetexts(movetexts)
+
+    enc_sem = compress_arith_bytes(sem_stream)
+    enc_mov = compress_arith_bytes(mov_stream)
+
+    return (b'\x02'
+            + _enc_varint(len(headers))
+            + _enc_varint(len(enc_sem))
+            + enc_sem
+            + enc_mov)
+
+
+def decompress_semantic(payload):
+    flag = payload[0]
+    if flag == 0x00:
+        return decompress_arith_bytes(payload[1:])
+    if flag == 0x02:
+        pos = 1
+        n_games, pos = _dec_varint(payload, pos)
+        len_sem, pos = _dec_varint(payload, pos)
+        enc_sem = payload[pos:pos + len_sem]; pos += len_sem
+        enc_mov = payload[pos:]
+        sem_stream = decompress_arith_bytes(enc_sem)
+        mov_stream = decompress_arith_bytes(enc_mov)
+        headers   = _decode_all_headers(sem_stream, n_games)
+        movetexts = _decode_all_movetexts(mov_stream, n_games)
+        return _assemble_pgn(headers, movetexts)
+    raise ValueError("flag mode semantic desconegut: %d" % flag)
+
+
+# --- Movetext -------------------------------------------------------------
+#
+# A la primera iteracio intentava comprimir els comentaris d'eval
+# (`{ [%eval 0.36] }`) convertint-los a una representacio binaria (1 byte
+# de marker + valor packed). Pensava que seria un guany gran perque son
+# ~15% del fitxer, pero el range coder ja els comprimia molt be perque el
+# patro de text es molt predictible. Substituir-lo per binari feia que els
+# bytes fossin menys predictibles pel RC i la ratio empitjorava.
+#
+# Acabem concatenant els movetexts amb un byte sentinella (_SEP = \x04,
+# que no apareix als fitxers) i deixant que el RC s'encarregui de la
+# resta. Aquesta es l'aproximacio que mes comprimeix dels benchmarks.
+
+
+def _encode_all_movetexts(movetexts):
+    return _SEP.join(movetexts)
+
+
+def _decode_all_movetexts(stream, n_games):
+    parts = stream.split(_SEP)
+    if len(parts) != n_games:
+        raise ValueError("nombre de movetexts no coincideix: %d vs %d"
+                         % (len(parts), n_games))
+    return parts
+
 
 MODE_FUNCS = {
     MODE_IDENTITY   : (compress_identity,    decompress_identity),
     MODE_ARITH_BYTES: (compress_arith_bytes, decompress_arith_bytes),
+    MODE_SPLIT      : (compress_split,       decompress_split),
+    MODE_SEMANTIC   : (compress_semantic,    decompress_semantic),
 }
 
 

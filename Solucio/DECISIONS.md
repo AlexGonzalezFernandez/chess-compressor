@@ -166,3 +166,106 @@ R cap a 4.5-5.
 4. Si es la fase 3: ja tinc la infraestructura per afegir un mode nou al
    MODE_REGISTRY. Decidir si separo headers i movetext en dos streams
    dins del mateix fitxer (probablement si).
+
+
+---
+
+## Fase 3 (feta)
+
+Plantejament per sub-fases, cadascuna amb verificacio lossless abans de
+continuar.
+
+### 3a - Separar streams de capçaleres i movetext
+
+Els tags son ~40% del fitxer i tenen una distribucio de bytes molt
+diferent dels moviments SAN. Separar-los en dos streams que es comprimeixen
+cada un pel seu compte permet que el model ordre-2 s'especialitzi millor
+en cada distribucio.
+
+Format del payload en mode SPLIT:
+
+    byte  0         : flag (0x00 = fallback generic, 0x01 = split)
+    bytes 1..4      : longitud del stream de capçaleres comprimit
+    bytes 5..       : stream capçaleres comprimit + stream movetext comprimit
+
+El parser aprofita que el format PGN de Lichess es molt regular: separador
+\n\n entre tags i movetext d'una mateixa partida i entre partides, i el
+fitxer acaba amb "resultat\n". Els 7 fitxers de test segueixen aquesta
+convencio. Si trobem un fitxer no canonic (per exemple amb \r\n) fem
+fallback al mode generic.
+
+Guany: R 3.893 -> 4.041.
+
+### 3b - Codificacio semantica dels tags
+
+Els fitxers nomes tenen 17 tags diferents, en un ordre canonic (amb
+variants per opcionals). Per cada partida emeto:
+  1. Un byte de flags amb 4 bits que diuen quins tags opcionals
+     (WhiteRatingDiff, BlackRatingDiff, WhiteTitle, BlackTitle) hi son.
+  2. Els valors dels tags en ordre canonic, cadascun amb una codificacio
+     especifica al seu tipus:
+       - Result, Termination, Title: 1 byte marker
+       - UTCDate: 3 bytes packed (year-1900 | month | day)
+       - UTCTime: 3 bytes com segons del dia
+       - ELOs: 2 bytes uint16
+       - ECO: 2 bytes packed (A-E × 100 + 0-99)
+       - TimeControl: 2 varints
+       - Site: prefix "https://lichess.org/" + 8 chars base62
+       - Event: 3 valors curts comuns (Blitz/Classical/Bullet game) + 2
+         variants tournament/swiss amb id de 8 chars
+       - RatingDiffs: zigzag varint (signed)
+       - White/Black/Opening: strings per resoldre a la 3c
+
+Cada tag te un marker per si el valor no encaixa al format esperat, en
+aquest cas faig fallback a string pla. Aixi el lossless no trenca mai.
+
+Guany acumulat: R 4.041 -> 4.566.
+
+### 3c - Diccionari intra-fitxer per jugadors i obertures
+
+Dins d'un mateix fitxer els jugadors i les obertures es repeteixen
+bastant (factor ~3-6x). Al emet un string, si ja l'hem vist emetem
+\x00 + index varint; si es nou, \x01 + longitud varint + bytes, i
+l'afegim al diccionari. White i Black comparteixen diccionari perque un
+mateix usuari juga amb les dues pieces. Opening te el seu propi.
+
+Guany acumulat: R 4.566 -> 4.828.
+
+### 3d - Movetext: eval binari (descartat)
+
+Pensava que comprimir els ~15% de bytes dels comentaris
+`{ [%eval X] }` a representacio binaria (1 byte de marker + valor
+packed) seria un guany gran. Els vaig implementar, pero el resultat va
+ser sorprenent: empitjorava lleugerament la ratio.
+
+Motius:
+  - El range coder aprenia perfectament el patro literal `{ [%eval `
+    (10 bytes repetits milers de cops) i el comprimia quasi a res. Els
+    bytes del valor decimal (0.36, 1.25, etc.) tambe son prou regulars
+    per un model ordre-2.
+  - Canviar-ho per bytes binaris feia que els bytes fossin mes
+    arbitraris i menys compresibles.
+  - A mes, els bytes del valor binari podien coincidir amb el byte
+    sentinella entre movetexts, que em forçava a framing amb varints de
+    longitud, que afegia overhead.
+
+Conclusio: deixo els evals com a text i confio en el RC.
+
+
+## Estat actual (fase 3 acabada)
+
+R agregat: 4.828
+Velocitats: ~500 kB/s compressio, ~550 kB/s descompressio.
+Lossless: verificat amb sha256 sobre els 7 fitxers.
+Executable: 36.6 KB (cap penalitzacio per mida).
+
+Nota estimada: amb Rmin=3 Rmax=6 (cas probable), nota ~4.96/7.5 sobre
+el 75% de la practica. Sobre 10, uns 5.0 nomes amb la ratio (falta el
+25% del ranking).
+
+### Que queda
+
+- Fase 4 (motor d'escacs, index de moviments legals). Es la unica via
+  per pujar R cap a 6+. Molta feina i risc de no passar el limit de
+  velocitat en Python pur.
+- Fase 5: Document.pdf final, netejar codi, verificar a la FIB.
