@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# Practica CDI 2025-2026. Compressor/descompressor de fitxers PGN.
+#
+# Us: python3 compress.src infile outfile
+#
+# Detecta sol si el fitxer d'entrada ja esta comprimit per aquest programa
+# (mira si comença per "CDI1"). Si ho esta, el descomprimeix; si no, el
+# comprimeix.
+
+import os
+import sys
+import struct
+import array
+
+# --- Format ---------------------------------------------------------------
+
+MAGIC = b"CDI1"
+FORMAT_VERSION = 1
+
+# Modes de compressio. De moment nomes faig servir el 1.
+MODE_IDENTITY    = 0
+MODE_ARITH_BYTES = 1
+
+DEFAULT_MODE = MODE_ARITH_BYTES
+
+
+# --- Identity (nomes per debugar) -----------------------------------------
+
+def compress_identity(data):
+    return data
+
+def decompress_identity(payload):
+    return payload
+
+
+# --- Range coder ----------------------------------------------------------
+#
+# Codificador aritmetic de 32 bits que renormalitza byte a byte (range coder)
+# en comptes de bit a bit. Aixo redueix molt les iteracions del loop intern,
+# que en Python pur es el factor limitant. La perdua de compressio respecte
+# al bit a bit es inapreciable.
+#
+# Carry propagation: si un byte s'hagues de modificar per un increment
+# posterior, l'ajorno fins que sapiga si ve carry o no. Els bytes pendents
+# es compten amb "ffnum" (son tots 0xFF mentre no arribi el carry; si arriba,
+# es converteixen en 0x00 i el byte anterior s'incrementa).
+#
+# Un detall practic: l'encoder sempre emet un primer byte (que pot ser 0x00
+# "fictici"), i el decoder el descarta sempre. Aixo perd 1 byte per fitxer
+# pero simplifica la inicialitzacio del decoder i em treu una font de bugs
+# subtils que havia tingut amb la versio que intentava estalviar-lo.
+
+_RC_BOT = 1 << 24
+
+
+class RangeEncoder:
+    __slots__ = ("low", "rng", "out", "buffer", "ffnum")
+
+    def __init__(self):
+        self.low    = 0
+        self.rng    = 0xFFFFFFFF
+        self.out    = bytearray()
+        self.buffer = 0
+        self.ffnum  = 0
+
+    def _shift_low(self):
+        # Si el byte de mes pes no es 0xFF, o si ha arribat el carry, ja el
+        # podem fixar. Si no, l'ajornem.
+        if self.low < 0xFF000000 or self.low >= 0x100000000:
+            carry = 1 if self.low >= 0x100000000 else 0
+            self.out.append((self.buffer + carry) & 0xFF)
+            fill = 0xFF if carry == 0 else 0x00
+            for _ in range(self.ffnum):
+                self.out.append(fill)
+            self.ffnum  = 0
+            self.buffer = (self.low >> 24) & 0xFF
+        else:
+            self.ffnum += 1
+        self.low = (self.low << 8) & 0xFFFFFFFF
+
+    def encode(self, cum_lo, cum_hi, total):
+        r = self.rng // total
+        # deixo que low es pugui desbordar per sobre de 2^32; aixi detecto
+        # el carry mirant si low >= 2^32
+        self.low = self.low + r * cum_lo
+        self.rng = r * (cum_hi - cum_lo)
+        while self.rng < _RC_BOT:
+            self.rng <<= 8
+            self._shift_low()
+
+    def finish(self):
+        # Cinc iteracions de _shift_low per drenar l'estat (buffer + 4 bytes
+        # de low).
+        for _ in range(5):
+            self._shift_low()
+        return bytes(self.out)
+
+
+class RangeDecoder:
+    __slots__ = ("rng", "code", "data", "pos")
+
+    def __init__(self, data):
+        self.data = data
+        self.pos  = 0
+        self.rng  = 0xFFFFFFFF
+        # Descarta el primer byte (el que l'encoder emet sempre) i llegeix
+        # els 4 seguents com a "code" inicial.
+        self._read()
+        self.code = 0
+        for _ in range(4):
+            self.code = (self.code << 8) | self._read()
+
+    def _read(self):
+        if self.pos < len(self.data):
+            b = self.data[self.pos]
+            self.pos += 1
+            return b
+        return 0
+
+    def get_target(self, total):
+        r = self.rng // total
+        return self.code // r
+
+    def advance(self, cum_lo, cum_hi, total):
+        r = self.rng // total
+        self.code -= r * cum_lo
+        self.rng   = r * (cum_hi - cum_lo)
+        while self.rng < _RC_BOT:
+            self.rng  = (self.rng << 8) & 0xFFFFFFFF
+            self.code = ((self.code << 8) | self._read()) & 0xFFFFFFFF
+
+
+# --- Codificador aritmetic bit a bit --------------------------------------
+#
+# Aquesta versio (a la Moffat-Neal-Witten) es la que vaig escriure primer,
+# seguint els apunts dels qüestionaris. Funciona i es correcta, pero nomes
+# arriba a uns 100 kB/s en Python, massa lenta. La deixo al fitxer per
+# referencia i per si a alguna sub-part la vull fer servir puntualment.
+
+_PREC    = 32
+_TOP     = 1 << _PREC
+_HALF    = _TOP >> 1
+_QUARTER = _TOP >> 2
+_THREE_Q = _HALF + _QUARTER
+_MASK    = _TOP - 1
+
+
+class _BitOut:
+    __slots__ = ("buf", "cur", "n")
+    def __init__(self):
+        self.buf = bytearray()
+        self.cur = 0
+        self.n   = 0
+    def write_bit(self, b):
+        self.cur = (self.cur << 1) | (b & 1)
+        self.n  += 1
+        if self.n == 8:
+            self.buf.append(self.cur)
+            self.cur = 0
+            self.n   = 0
+    def flush(self):
+        if self.n:
+            self.buf.append(self.cur << (8 - self.n))
+            self.cur = 0
+            self.n   = 0
+    def getvalue(self):
+        return bytes(self.buf)
+
+
+class _BitIn:
+    __slots__ = ("data", "pos", "cur", "n")
+    def __init__(self, data):
+        self.data = data
+        self.pos  = 0
+        self.cur  = 0
+        self.n    = 0
+    def read_bit(self):
+        if self.n == 0:
+            if self.pos < len(self.data):
+                self.cur = self.data[self.pos]
+                self.pos += 1
+            else:
+                self.cur = 0
+            self.n = 8
+        b = (self.cur >> 7) & 1
+        self.cur = (self.cur << 1) & 0xFF
+        self.n  -= 1
+        return b
+
+
+class ArithEncoder:
+    __slots__ = ("low", "high", "pending", "out")
+    def __init__(self):
+        self.low     = 0
+        self.high    = _TOP - 1
+        self.pending = 0
+        self.out     = _BitOut()
+    def _emit(self, bit):
+        self.out.write_bit(bit)
+        for _ in range(self.pending):
+            self.out.write_bit(1 - bit)
+        self.pending = 0
+    def encode(self, cum_lo, cum_hi, total):
+        rng = self.high - self.low + 1
+        self.high = self.low + (rng * cum_hi) // total - 1
+        self.low  = self.low + (rng * cum_lo) // total
+        while True:
+            if self.high < _HALF:
+                self._emit(0)
+            elif self.low >= _HALF:
+                self._emit(1)
+                self.low  -= _HALF
+                self.high -= _HALF
+            elif self.low >= _QUARTER and self.high < _THREE_Q:
+                self.pending += 1
+                self.low  -= _QUARTER
+                self.high -= _QUARTER
+            else:
+                break
+            self.low  = (self.low  << 1) & _MASK
+            self.high = ((self.high << 1) & _MASK) | 1
+    def finish(self):
+        self.pending += 1
+        if self.low < _QUARTER:
+            self._emit(0)
+        else:
+            self._emit(1)
+        self.out.flush()
+        return self.out.getvalue()
+
+
+class ArithDecoder:
+    __slots__ = ("low", "high", "code", "bin")
+    def __init__(self, data):
+        self.low  = 0
+        self.high = _TOP - 1
+        self.bin  = _BitIn(data)
+        self.code = 0
+        for _ in range(_PREC):
+            self.code = (self.code << 1) | self.bin.read_bit()
+    def get_target(self, total):
+        rng = self.high - self.low + 1
+        return ((self.code - self.low + 1) * total - 1) // rng
+    def advance(self, cum_lo, cum_hi, total):
+        rng = self.high - self.low + 1
+        self.high = self.low + (rng * cum_hi) // total - 1
+        self.low  = self.low + (rng * cum_lo) // total
+        while True:
+            if self.high < _HALF:
+                pass
+            elif self.low >= _HALF:
+                self.code -= _HALF
+                self.low  -= _HALF
+                self.high -= _HALF
+            elif self.low >= _QUARTER and self.high < _THREE_Q:
+                self.code -= _QUARTER
+                self.low  -= _QUARTER
+                self.high -= _QUARTER
+            else:
+                break
+            self.low  = (self.low  << 1) & _MASK
+            self.high = ((self.high << 1) & _MASK) | 1
+            self.code = ((self.code << 1) & _MASK) | self.bin.read_bit()
+
+
+# --- Fenwick tree ---------------------------------------------------------
+#
+# Per cada context del model mantinc un Fenwick tree (BIT) de 256 posicions
+# amb les frequencies dels bytes que han aparegut en aquell context. Les
+# tres operacions que necessito son:
+#
+#   prefix(i)     suma freq[0..i-1]
+#   update(i, d)  freq[i] += d
+#   find(t)       minim i tal que prefix(i+1) > t
+#
+# Totes son O(log 256) = 8 operacions. Sobre list normal de Python
+# l'update seria O(256) i es el que em limita la velocitat.
+#
+# Inicialitzacio: totes les freqs a 1 (smoothing Laplace) per garantir
+# p > 0 a qualsevol simbol, que es el que el range coder necessita.
+
+class Fenwick:
+    __slots__ = ("t", "n", "total")
+    def __init__(self, n=256, init=1):
+        self.n = n
+        self.t = array.array('i', [0] * (n + 1))
+        for i in range(n):
+            j = i + 1
+            while j <= n:
+                self.t[j] += init
+                j += j & -j
+        self.total = init * n
+
+    def prefix(self, i):
+        s = 0
+        while i > 0:
+            s += self.t[i]
+            i -= i & -i
+        return s
+
+    def update(self, i, delta):
+        self.total += delta
+        j = i + 1
+        while j <= self.n:
+            self.t[j] += delta
+            j += j & -j
+
+    def find(self, target):
+        n = self.n
+        p = 1
+        while (p << 1) <= n:
+            p <<= 1
+        idx = 0
+        while p:
+            nxt = idx + p
+            if nxt <= n and self.t[nxt] <= target:
+                idx = nxt
+                target -= self.t[nxt]
+            p >>= 1
+        return idx
+
+
+def _halve_fenwick(f, n):
+    # Divideix totes les frequencies per 2 (mantenint minim 1). Es crida
+    # quan el total d'un context passa de 2^24 per evitar desbordament en
+    # els calculs del range coder.
+    freqs = [max(1, (f.prefix(i + 1) - f.prefix(i)) >> 1) for i in range(n)]
+    f.t = array.array('i', [0] * (n + 1))
+    f.total = 0
+    for i, v in enumerate(freqs):
+        j = i + 1
+        while j <= n:
+            f.t[j] += v
+            j += j & -j
+        f.total += v
+
+
+# --- Compressor: model ordre-2 + range coder ------------------------------
+#
+# Per cada simbol: context = parell dels dos bytes anteriors (16 bits). Es
+# creen els arbres Fenwick sota demanda. En els fitxers PGN reals surten uns
+# pocs milers dels 65k contextos possibles.
+#
+# El fitxer comprimit comença amb 4 bytes big-endian amb la mida original,
+# per no haver d'ampliar l'alfabet a 257 amb un simbol EOF.
+
+_RESCALE = 1 << 24
+
+
+def compress_arith_bytes(data):
+    enc = RangeEncoder()
+    trees = {}
+    ctx = 0
+    for b in data:
+        t = trees.get(ctx)
+        if t is None:
+            t = Fenwick(256, 1)
+            trees[ctx] = t
+        total  = t.total
+        cum_lo = t.prefix(b)
+        cum_hi = t.prefix(b + 1)
+        enc.encode(cum_lo, cum_hi, total)
+        t.update(b, 1)
+        if t.total > _RESCALE:
+            _halve_fenwick(t, 256)
+        ctx = ((ctx << 8) & 0xFFFF) | b
+    return len(data).to_bytes(4, "big") + enc.finish()
+
+
+def decompress_arith_bytes(payload):
+    # Aquest loop esta expandit i sense crides a metodes. Si deixo la versio
+    # "bonica" amb t.prefix(), t.update(), dec.get_target()... la velocitat
+    # baixa a uns 245 kB/s i no passa el llindar de 250.
+    #
+    # La logica equivalent, mes llegible, seria:
+    #     total   = t.total
+    #     target  = dec.get_target(total)
+    #     sym     = t.find(target)
+    #     cum_lo  = t.prefix(sym)
+    #     cum_hi  = t.prefix(sym + 1)
+    #     dec.advance(cum_lo, cum_hi, total)
+    #     t.update(sym, 1)
+    #
+    # Inline-ar-ho tot i treure els atributs del dec a variables locals
+    # fa que pugi a ~385 kB/s.
+    n = int.from_bytes(payload[:4], "big")
+    dec = RangeDecoder(payload[4:])
+    trees = {}
+    totals = {}
+    init_tree = Fenwick(256, 1).t   # plantilla per copiar
+    ctx = 0
+    out = bytearray(n)
+
+    # Atributs del decoder com a variables locals
+    dec_rng  = dec.rng
+    dec_code = dec.code
+    dec_data = dec.data
+    dec_pos  = dec.pos
+
+    for i in range(n):
+        tt = trees.get(ctx)
+        if tt is None:
+            tt = array.array('i', init_tree)
+            trees[ctx]  = tt
+            totals[ctx] = 256
+        total = totals[ctx]
+
+        r = dec_rng // total
+        target = dec_code // r
+
+        # Fenwick.find inline
+        p = 128
+        idx = 0
+        while p:
+            nxt = idx + p
+            if tt[nxt] <= target:
+                idx     = nxt
+                target -= tt[nxt]
+            p >>= 1
+        sym = idx
+
+        # prefix(sym)
+        s_lo = 0
+        j = sym
+        while j > 0:
+            s_lo += tt[j]
+            j    -= j & -j
+
+        # prefix(sym+1)
+        s_hi = 0
+        j = sym + 1
+        while j > 0:
+            s_hi += tt[j]
+            j    -= j & -j
+
+        cum_lo = s_lo
+        cum_hi = s_hi
+
+        # RangeDecoder.advance inline
+        dec_code -= r * cum_lo
+        dec_rng   = r * (cum_hi - cum_lo)
+        while dec_rng < _RC_BOT:
+            dec_rng = (dec_rng << 8) & 0xFFFFFFFF
+            if dec_pos < len(dec_data):
+                b_read = dec_data[dec_pos]
+                dec_pos += 1
+            else:
+                b_read = 0
+            dec_code = ((dec_code << 8) | b_read) & 0xFFFFFFFF
+
+        out[i] = sym
+
+        # Fenwick.update(sym, 1) inline
+        totals[ctx] = total + 1
+        j = sym + 1
+        while j <= 256:
+            tt[j] += 1
+            j += j & -j
+
+        if totals[ctx] > _RESCALE:
+            # Rescaling: divideixo frequencies per 2. Passa molt de tant en
+            # tant, el codi no cal que sigui optim.
+            freqs = []
+            prev = 0
+            for k in range(256):
+                p = 0
+                jj = k + 1
+                while jj > 0:
+                    p  += tt[jj]
+                    jj -= jj & -jj
+                freqs.append(max(1, (p - prev) >> 1))
+                prev = p
+            new_tt = array.array('i', [0] * 257)
+            new_total = 0
+            for k, v in enumerate(freqs):
+                new_total += v
+                jj = k + 1
+                while jj <= 256:
+                    new_tt[jj] += v
+                    jj += jj & -jj
+            trees[ctx]  = new_tt
+            totals[ctx] = new_total
+            tt = new_tt
+
+        ctx = ((ctx << 8) & 0xFFFF) | sym
+
+    return bytes(out)
+
+
+# --- Embolcall del fitxer comprimit ---------------------------------------
+
+MODE_FUNCS = {
+    MODE_IDENTITY   : (compress_identity,    decompress_identity),
+    MODE_ARITH_BYTES: (compress_arith_bytes, decompress_arith_bytes),
+}
+
+
+def compress(data, mode=DEFAULT_MODE):
+    if mode not in MODE_FUNCS:
+        raise ValueError("mode %d no implementat" % mode)
+    enc_fn, _ = MODE_FUNCS[mode]
+    header = MAGIC + struct.pack("BB", FORMAT_VERSION, mode)
+    return header + enc_fn(data)
+
+
+def decompress(blob):
+    if len(blob) < 6 or blob[:4] != MAGIC:
+        raise ValueError("el fitxer no esta en format CDI1")
+    version, mode = struct.unpack("BB", blob[4:6])
+    if version != FORMAT_VERSION:
+        raise ValueError("versio de format %d no suportada" % version)
+    if mode not in MODE_FUNCS:
+        raise ValueError("mode %d no implementat" % mode)
+    _, dec_fn = MODE_FUNCS[mode]
+    return dec_fn(blob[6:])
+
+
+def is_compressed(data):
+    return len(data) >= 4 and data[:4] == MAGIC
+
+
+# --- Main -----------------------------------------------------------------
+
+def main(argv):
+    if len(argv) != 3:
+        prog = os.path.basename(argv[0]) if argv else "compress.cdi"
+        sys.stderr.write("us: %s infile outfile\n" % prog)
+        return 2
+
+    infile, outfile = argv[1], argv[2]
+
+    try:
+        with open(infile, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        sys.stderr.write("error llegint %s: %s\n" % (infile, e))
+        return 1
+
+    try:
+        if is_compressed(data):
+            out = decompress(data)
+        else:
+            out = compress(data)
+    except Exception as e:
+        sys.stderr.write("error: %s\n" % e)
+        return 1
+
+    try:
+        with open(outfile, "wb") as f:
+            f.write(out)
+    except OSError as e:
+        sys.stderr.write("error escrivint %s: %s\n" % (outfile, e))
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
