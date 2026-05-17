@@ -24,8 +24,9 @@ MODE_IDENTITY    = 0   # copia literal, per debug
 MODE_ARITH_BYTES = 1   # range coder + model ordre-2 sobre tot el fitxer
 MODE_SPLIT       = 2   # separa capçaleres i movetext, cada stream al seu RC
 MODE_SEMANTIC    = 3   # parser semantic dels tags
+MODE_CHESS       = 4   # semantic + moviments SAN com index de moviment legal
 
-DEFAULT_MODE = MODE_SEMANTIC
+DEFAULT_MODE = MODE_CHESS
 
 
 # --- Identity (nomes per debugar) -----------------------------------------
@@ -525,24 +526,35 @@ def decompress_arith_bytes(payload):
 # fitxers PGN fan servir nomes bytes 10..125 i els markers 0x01..0x03 els
 # faig servir per comentaris d'eval, aixi que el 0x04 es segur.
 _SEP = b'\x04'
+_EOL_LF   = 0
+_EOL_CRLF = 1
+_LAST_SPLIT_EOL = b'\n'
 
 
 def _try_split_pgn(data):
     # Retorna (llista_headers, llista_movetexts) si el fitxer segueix
     # l'estructura canonica que explota aquest mode. Retorna None si no
     # hi encaixa.
+    global _LAST_SPLIT_EOL
     if b'\r' in data:
+        if b'\r\n' not in data or data.replace(b'\r\n', b'').find(b'\r') >= 0:
+            return None
+        eol = b'\r\n'
+    else:
+        eol = b'\n'
+    _LAST_SPLIT_EOL = eol
+    if eol == b'\n' and b'\r' in data:
         return None
-    if not data.endswith(b'\n'):
+    if not data.endswith(eol):
         return None
-    if b'\n\n\n' in data:
+    if eol + eol + eol in data:
         # Tres salts seguits no haurien d'apareixer
         return None
 
     # Normalitzo: despres de l'ultim movetext hi ha un sol \n i no \n\n,
     # pero per simplicitat afegeixo un \n mes (i el trauré en descompressio).
     # Aixi puc dividir uniformement per \n\n.
-    blocks = (data + b'\n').split(b'\n\n')
+    blocks = (data + eol).split(eol + eol)
     # L'ultim bloc ha de ser buit
     if blocks[-1] != b'':
         return None
@@ -557,13 +569,13 @@ def _try_split_pgn(data):
             # Bloc de tags: ha de començar amb '[' i acabar amb ']'
             if not (b.startswith(b'[') and b.endswith(b']')):
                 return None
-            headers.append(b)
+            headers.append(b.replace(eol, b'\n'))
         else:
             # Bloc de movetext: ha d'acabar amb un dels 4 resultats
             if not (b.endswith(b'1-0') or b.endswith(b'0-1')
                     or b.endswith(b'1/2-1/2') or b.endswith(b'*')):
                 return None
-            movetexts.append(b)
+            movetexts.append(b.replace(eol, b'\n'))
 
     if len(headers) != len(movetexts):
         return None
@@ -571,15 +583,19 @@ def _try_split_pgn(data):
 
 
 def _assemble_pgn(headers, movetexts):
+    eol = _LAST_SPLIT_EOL
     parts = []
     for i, (h, m) in enumerate(zip(headers, movetexts)):
+        if eol != b'\n':
+            h = h.replace(b'\n', eol)
+            m = m.replace(b'\n', eol)
         parts.append(h)
-        parts.append(b'\n\n')
+        parts.append(eol + eol)
         parts.append(m)
         if i < len(headers) - 1:
-            parts.append(b'\n\n')
+            parts.append(eol + eol)
         else:
-            parts.append(b'\n')
+            parts.append(eol)
     return b''.join(parts)
 
 
@@ -599,6 +615,7 @@ def compress_split(data):
 
     # flag=1 + 4 bytes amb la longitud del primer stream comprimit + els dos
     return (b'\x01'
+            + bytes([_EOL_CRLF if _LAST_SPLIT_EOL == b'\r\n' else _EOL_LF])
             + len(enc_h).to_bytes(4, 'big')
             + enc_h
             + enc_m)
@@ -609,9 +626,11 @@ def decompress_split(payload):
     if flag == 0x00:
         return decompress_arith_bytes(payload[1:])
 
-    len_h = int.from_bytes(payload[1:5], 'big')
-    enc_h = payload[5:5 + len_h]
-    enc_m = payload[5 + len_h:]
+    global _LAST_SPLIT_EOL
+    _LAST_SPLIT_EOL = b'\r\n' if payload[1] == _EOL_CRLF else b'\n'
+    len_h = int.from_bytes(payload[2:6], 'big')
+    enc_h = payload[6:6 + len_h]
+    enc_m = payload[6 + len_h:]
 
     stream_h = decompress_arith_bytes(enc_h)
     stream_m = decompress_arith_bytes(enc_m)
@@ -1099,6 +1118,7 @@ def compress_semantic(data):
     enc_mov = compress_arith_bytes(mov_stream)
 
     return (b'\x02'
+            + bytes([_EOL_CRLF if _LAST_SPLIT_EOL == b'\r\n' else _EOL_LF])
             + _enc_varint(len(headers))
             + _enc_varint(len(enc_sem))
             + enc_sem
@@ -1110,7 +1130,9 @@ def decompress_semantic(payload):
     if flag == 0x00:
         return decompress_arith_bytes(payload[1:])
     if flag == 0x02:
-        pos = 1
+        global _LAST_SPLIT_EOL
+        _LAST_SPLIT_EOL = b'\r\n' if payload[1] == _EOL_CRLF else b'\n'
+        pos = 2
         n_games, pos = _dec_varint(payload, pos)
         len_sem, pos = _dec_varint(payload, pos)
         enc_sem = payload[pos:pos + len_sem]; pos += len_sem
@@ -1149,11 +1171,586 @@ def _decode_all_movetexts(stream, n_games):
     return parts
 
 
+# --- Movetext amb motor d'escacs -----------------------------------------
+#
+# Primera versio de la fase 4. Codifica cada SAN com l'index del moviment
+# dins de la llista legal de la posicio actual. Per no comprometre el
+# round-trip, si una partida no es pot parsejar sencera es guarda literal.
+
+_FILES = b'abcdefgh'
+_RANKS = b'12345678'
+_KNIGHT_DELTAS = (33, 31, 18, 14, -33, -31, -18, -14)
+_KING_DELTAS   = (16, -16, 1, -1, 17, 15, -17, -15)
+_BISHOP_DELTAS = (17, 15, -17, -15)
+_ROOK_DELTAS   = (16, -16, 1, -1)
+_PROMOS        = b'QRBN'
+
+
+def _sq(file_i, rank_i):
+    return rank_i * 16 + file_i
+
+
+def _sq_name(s):
+    return bytes([_FILES[s & 7], _RANKS[s >> 4]])
+
+
+def _parse_sq(b):
+    if len(b) != 2 or b[0] not in _FILES or b[1] not in _RANKS:
+        return -1
+    return _sq(_FILES.index(b[0]), _RANKS.index(b[1]))
+
+
+class _ChessPos:
+    __slots__ = ("b", "white", "castle", "ep", "wk", "bk")
+
+    def __init__(self):
+        self.b = ['.'] * 128
+        for i, p in enumerate("RNBQKBNR"):
+            self.b[i] = p
+            self.b[112 + i] = p.lower()
+        for i in range(8):
+            self.b[16 + i] = 'P'
+            self.b[96 + i] = 'p'
+        self.white = True
+        self.castle = 0x0F  # 1 K, 2 Q, 4 k, 8 q
+        self.ep = -1
+        self.wk = _sq(4, 0)
+        self.bk = _sq(4, 7)
+
+    def clone(self):
+        p = _ChessPos.__new__(_ChessPos)
+        p.b = self.b[:]
+        p.white = self.white
+        p.castle = self.castle
+        p.ep = self.ep
+        p.wk = self.wk
+        p.bk = self.bk
+        return p
+
+    def _own(self, pc):
+        return pc != '.' and (pc.isupper() == self.white)
+
+    def _enemy(self, pc):
+        return pc != '.' and (pc.isupper() != self.white)
+
+    def attacked(self, s, by_white):
+        b = self.b
+        pawn_from = (s - 15, s - 17) if by_white else (s + 15, s + 17)
+        for q in pawn_from:
+            if not (q & 0x88) and b[q] == ('P' if by_white else 'p'):
+                return True
+        target_n = 'N' if by_white else 'n'
+        for d in _KNIGHT_DELTAS:
+            q = s + d
+            if not (q & 0x88) and b[q] == target_n:
+                return True
+        target_k = 'K' if by_white else 'k'
+        for d in _KING_DELTAS:
+            q = s + d
+            if not (q & 0x88) and b[q] == target_k:
+                return True
+        for dirs, pieces in ((_BISHOP_DELTAS, ('B', 'Q')), (_ROOK_DELTAS, ('R', 'Q'))):
+            wanted = pieces if by_white else tuple(x.lower() for x in pieces)
+            for d in dirs:
+                q = s + d
+                while not (q & 0x88):
+                    pc = b[q]
+                    if pc != '.':
+                        if pc in wanted:
+                            return True
+                        break
+                    q += d
+        return False
+
+    def in_check(self, white):
+        return self.attacked(self.wk if white else self.bk, not white)
+
+    def pseudo_moves(self):
+        b = self.b
+        white = self.white
+        out = []
+        for fr in range(128):
+            if fr & 0x88:
+                continue
+            pc = b[fr]
+            if pc == '.' or pc.isupper() != white:
+                continue
+            upc = pc.upper()
+            if upc == 'P':
+                step = 16 if white else -16
+                start_rank = 1 if white else 6
+                promo_rank = 6 if white else 1
+                one = fr + step
+                if not (one & 0x88) and b[one] == '.':
+                    if fr >> 4 == promo_rank:
+                        for pr in _PROMOS:
+                            out.append((fr, one, chr(pr)))
+                    else:
+                        out.append((fr, one, ''))
+                        two = one + step
+                        if fr >> 4 == start_rank and b[two] == '.':
+                            out.append((fr, two, ''))
+                for d in (step + 1, step - 1):
+                    to = fr + d
+                    if to & 0x88:
+                        continue
+                    if self._enemy(b[to]) or to == self.ep:
+                        if fr >> 4 == promo_rank:
+                            for pr in _PROMOS:
+                                out.append((fr, to, chr(pr)))
+                        else:
+                            out.append((fr, to, ''))
+            elif upc == 'N':
+                for d in _KNIGHT_DELTAS:
+                    to = fr + d
+                    if not (to & 0x88) and not self._own(b[to]):
+                        out.append((fr, to, ''))
+            elif upc in ('B', 'R', 'Q'):
+                dirs = _BISHOP_DELTAS if upc == 'B' else _ROOK_DELTAS if upc == 'R' else _BISHOP_DELTAS + _ROOK_DELTAS
+                for d in dirs:
+                    to = fr + d
+                    while not (to & 0x88):
+                        if self._own(b[to]):
+                            break
+                        out.append((fr, to, ''))
+                        if self._enemy(b[to]):
+                            break
+                        to += d
+            elif upc == 'K':
+                for d in _KING_DELTAS:
+                    to = fr + d
+                    if not (to & 0x88) and not self._own(b[to]):
+                        out.append((fr, to, ''))
+                if white and fr == _sq(4, 0) and not self.in_check(True):
+                    if (self.castle & 1 and b[_sq(5, 0)] == '.' and b[_sq(6, 0)] == '.'
+                            and not self.attacked(_sq(5, 0), False) and not self.attacked(_sq(6, 0), False)):
+                        out.append((fr, _sq(6, 0), ''))
+                    if (self.castle & 2 and b[_sq(3, 0)] == '.' and b[_sq(2, 0)] == '.' and b[_sq(1, 0)] == '.'
+                            and not self.attacked(_sq(3, 0), False) and not self.attacked(_sq(2, 0), False)):
+                        out.append((fr, _sq(2, 0), ''))
+                if (not white) and fr == _sq(4, 7) and not self.in_check(False):
+                    if (self.castle & 4 and b[_sq(5, 7)] == '.' and b[_sq(6, 7)] == '.'
+                            and not self.attacked(_sq(5, 7), True) and not self.attacked(_sq(6, 7), True)):
+                        out.append((fr, _sq(6, 7), ''))
+                    if (self.castle & 8 and b[_sq(3, 7)] == '.' and b[_sq(2, 7)] == '.' and b[_sq(1, 7)] == '.'
+                            and not self.attacked(_sq(3, 7), True) and not self.attacked(_sq(2, 7), True)):
+                        out.append((fr, _sq(2, 7), ''))
+        return out
+
+    def legal_moves(self):
+        side = self.white
+        out = []
+        for mv in self.pseudo_moves():
+            undo = self._push_undo(mv)
+            if not self.in_check(side):
+                out.append(mv)
+            self._pop_undo(undo)
+        return out
+
+    def _push_undo(self, mv):
+        fr, to, promo = mv
+        b = self.b
+        pc = b[fr]
+        cap = b[to]
+        undo_sqs = [fr, to]
+        old_ep = self.ep
+        undo = (self.white, self.castle, self.ep, self.wk, self.bk, undo_sqs)
+
+        if pc.upper() == 'P' and to == old_ep and cap == '.':
+            ep_sq = to - (16 if pc.isupper() else -16)
+            undo_sqs.append(ep_sq)
+        if pc == 'K' and fr == _sq(4, 0) and to == _sq(6, 0):
+            undo_sqs += [_sq(5, 0), _sq(7, 0)]
+        elif pc == 'K' and fr == _sq(4, 0) and to == _sq(2, 0):
+            undo_sqs += [_sq(3, 0), _sq(0, 0)]
+        elif pc == 'k' and fr == _sq(4, 7) and to == _sq(6, 7):
+            undo_sqs += [_sq(5, 7), _sq(7, 7)]
+        elif pc == 'k' and fr == _sq(4, 7) and to == _sq(2, 7):
+            undo_sqs += [_sq(3, 7), _sq(0, 7)]
+
+        seen = set()
+        saved = []
+        for s in undo_sqs:
+            if s not in seen:
+                seen.add(s)
+                saved.append((s, b[s]))
+        undo = (self.white, self.castle, self.ep, self.wk, self.bk, saved)
+
+        self.ep = -1
+        if pc.upper() == 'P' and to == old_ep and cap == '.':
+            b[ep_sq] = '.'
+
+        b[fr] = '.'
+        b[to] = promo if promo and pc.isupper() else promo.lower() if promo else pc
+
+        if pc == 'K':
+            self.wk = to
+            self.castle &= ~3
+            if fr == _sq(4, 0) and to == _sq(6, 0):
+                b[_sq(5, 0)], b[_sq(7, 0)] = b[_sq(7, 0)], '.'
+            elif fr == _sq(4, 0) and to == _sq(2, 0):
+                b[_sq(3, 0)], b[_sq(0, 0)] = b[_sq(0, 0)], '.'
+        elif pc == 'k':
+            self.bk = to
+            self.castle &= ~12
+            if fr == _sq(4, 7) and to == _sq(6, 7):
+                b[_sq(5, 7)], b[_sq(7, 7)] = b[_sq(7, 7)], '.'
+            elif fr == _sq(4, 7) and to == _sq(2, 7):
+                b[_sq(3, 7)], b[_sq(0, 7)] = b[_sq(0, 7)], '.'
+
+        if fr == _sq(0, 0) or to == _sq(0, 0): self.castle &= ~2
+        if fr == _sq(7, 0) or to == _sq(7, 0): self.castle &= ~1
+        if fr == _sq(0, 7) or to == _sq(0, 7): self.castle &= ~8
+        if fr == _sq(7, 7) or to == _sq(7, 7): self.castle &= ~4
+
+        if pc.upper() == 'P' and abs(to - fr) == 32:
+            self.ep = (to + fr) // 2
+        self.white = not self.white
+        return undo
+
+    def _pop_undo(self, undo):
+        self.white, self.castle, self.ep, self.wk, self.bk, saved = undo
+        b = self.b
+        for s, pc in saved:
+            b[s] = pc
+
+    def push(self, mv):
+        self._push_undo(mv)
+
+
+def _move_san(pos, mv, legal=None):
+    fr, to, promo = mv
+    b = pos.b
+    pc = b[fr]
+    upc = pc.upper()
+    if upc == 'K' and abs(to - fr) == 2:
+        base = b'O-O' if to > fr else b'O-O-O'
+    else:
+        capture = b[to] != '.' or (upc == 'P' and to == pos.ep)
+        parts = []
+        if upc != 'P':
+            parts.append(upc.encode('ascii'))
+            if legal is None:
+                legal = pos.legal_moves()
+            same = [m for m in legal if m != mv and m[1] == to and m[2] == promo
+                    and b[m[0]].upper() == upc]
+            if same:
+                same_file = any((m[0] & 7) == (fr & 7) for m in same)
+                same_rank = any((m[0] >> 4) == (fr >> 4) for m in same)
+                if not same_file:
+                    parts.append(bytes([_FILES[fr & 7]]))
+                elif not same_rank:
+                    parts.append(bytes([_RANKS[fr >> 4]]))
+                else:
+                    parts.append(bytes([_FILES[fr & 7], _RANKS[fr >> 4]]))
+        elif capture:
+            parts.append(bytes([_FILES[fr & 7]]))
+        if capture:
+            parts.append(b'x')
+        parts.append(_sq_name(to))
+        if promo:
+            parts.append(b'=' + promo.encode('ascii'))
+        base = b''.join(parts)
+
+    return base
+
+
+def _split_san_suffix(tok):
+    ann = b''
+    while tok and tok[-1:] in (b'!', b'?'):
+        ann = tok[-1:] + ann
+        tok = tok[:-1]
+    if tok and tok[-1:] in (b'+', b'#'):
+        ann = tok[-1:] + ann
+        tok = tok[:-1]
+    return tok, ann
+
+
+def _parse_san_core(tok):
+    if tok == b'O-O' or tok == b'0-0':
+        return ('K', 1, '', -1, -1, True)
+    if tok == b'O-O-O' or tok == b'0-0-0':
+        return ('K', -1, '', -1, -1, True)
+
+    promo = ''
+    eq = tok.find(b'=')
+    if eq >= 0:
+        if eq + 1 >= len(tok) or tok[eq + 1] not in _PROMOS:
+            return None
+        promo = chr(tok[eq + 1])
+        tok = tok[:eq]
+
+    if len(tok) < 2:
+        return None
+    to = _parse_sq(tok[-2:])
+    if to < 0:
+        return None
+    body = tok[:-2].replace(b'x', b'')
+    piece = 'P'
+    if body and body[0] in b'KQRBN':
+        piece = chr(body[0])
+        body = body[1:]
+    file_hint = -1
+    rank_hint = -1
+    if len(body) > 2:
+        return None
+    for c in body:
+        if c in _FILES:
+            file_hint = _FILES.index(c)
+        elif c in _RANKS:
+            rank_hint = _RANKS.index(c)
+        else:
+            return None
+    return (piece, to, promo, file_hint, rank_hint, False)
+
+
+def _try_encode_san_token(pos, tok):
+    core, ann = _split_san_suffix(tok)
+    parsed = _parse_san_core(core)
+    if parsed is None:
+        return None
+    piece, to, promo, file_hint, rank_hint, castle = parsed
+    moves = pos.pseudo_moves()
+    matches = []
+    for i, mv in enumerate(moves):
+        fr, mv_to, mv_promo = mv
+        pc = pos.b[fr].upper()
+        if pc != piece or mv_promo != promo:
+            continue
+        if castle:
+            if not (pc == 'K' and abs(mv_to - fr) == 2 and ((mv_to > fr) == (to > 0))):
+                continue
+        elif mv_to != to:
+            continue
+        if file_hint >= 0 and (fr & 7) != file_hint:
+            continue
+        if rank_hint >= 0 and (fr >> 4) != rank_hint:
+            continue
+        matches.append((i, mv))
+    side = pos.white
+    legal_matches = []
+    for idx, mv in matches:
+        undo = pos._push_undo(mv)
+        ok = not pos.in_check(side)
+        pos._pop_undo(undo)
+        if ok:
+            legal_matches.append((idx, mv))
+    if len(legal_matches) != 1:
+        return None
+    idx, mv = legal_matches[0]
+    hint = ((file_hint + 1) & 0x0F) | (((rank_hint + 1) & 0x0F) << 4)
+    if _move_san_stored(pos, mv, hint) != core:
+        return None
+    pos.push(mv)
+    meta = 0
+    rest = ann
+    if rest.startswith(b'+'):
+        meta |= 0x02
+        rest = rest[1:]
+    elif rest.startswith(b'#'):
+        meta |= 0x04
+        rest = rest[1:]
+    if hint:
+        meta |= 0x01
+    if rest:
+        meta |= 0x08
+    out = bytearray()
+    out += _enc_varint(idx)
+    out.append(meta)
+    if hint:
+        out.append(hint)
+    if rest:
+        out += _enc_str(rest)
+    return bytes(out)
+
+
+def _move_san_stored(pos, mv, hint):
+    fr, to, promo = mv
+    b = pos.b
+    pc = b[fr]
+    upc = pc.upper()
+    if upc == 'K' and abs(to - fr) == 2:
+        return b'O-O' if to > fr else b'O-O-O'
+    capture = b[to] != '.' or (upc == 'P' and to == pos.ep)
+    parts = []
+    if upc != 'P':
+        parts.append(upc.encode('ascii'))
+        fh = (hint & 0x0F) - 1
+        rh = ((hint >> 4) & 0x0F) - 1
+        if fh >= 0:
+            parts.append(bytes([_FILES[fh]]))
+        if rh >= 0:
+            parts.append(bytes([_RANKS[rh]]))
+    elif capture:
+        parts.append(bytes([_FILES[fr & 7]]))
+    if capture:
+        parts.append(b'x')
+    parts.append(_sq_name(to))
+    if promo:
+        parts.append(b'=' + promo.encode('ascii'))
+    return b''.join(parts)
+
+
+def _decode_san_record(pos, data, p):
+    idx, p = _dec_varint(data, p)
+    meta = data[p]; p += 1
+    hint = 0
+    if meta & 0x01:
+        hint = data[p]; p += 1
+    ann = b''
+    if meta & 0x02:
+        ann += b'+'
+    elif meta & 0x04:
+        ann += b'#'
+    if meta & 0x08:
+        extra, p = _dec_str(data, p)
+        ann += extra
+    moves = pos.pseudo_moves()
+    if idx >= len(moves):
+        raise ValueError("index de moviment fora de rang")
+    mv = moves[idx]
+    san = _move_san_stored(pos, mv, hint) + ann
+    pos.push(mv)
+    return san, p
+
+
+def _encode_movetext_chess_one(m):
+    pos = _ChessPos()
+    out = bytearray()
+    lit = bytearray()
+    i = 0
+    n_moves = 0
+    while i < len(m):
+        c = m[i]
+        if c in b' \t\r\n':
+            lit.append(c); i += 1; continue
+        if c == ord('{'):
+            j = m.find(b'}', i + 1)
+            if j < 0:
+                return None
+            lit += m[i:j + 1]; i = j + 1; continue
+        j = i
+        while j < len(m) and m[j] not in b' \t\r\n{':
+            j += 1
+        tok = m[i:j]
+        if tok in _RESULTS or tok.endswith(b'.') or tok.replace(b'.', b'').isdigit():
+            lit += tok
+        else:
+            enc = _try_encode_san_token(pos, tok)
+            if enc is None:
+                return None
+            if lit:
+                out.append(0)
+                out += _enc_str(bytes(lit))
+                lit.clear()
+            out.append(1)
+            out += enc
+            n_moves += 1
+        i = j
+    if lit:
+        out.append(0)
+        out += _enc_str(bytes(lit))
+    return _enc_varint(n_moves) + bytes(out)
+
+
+def _decode_movetext_chess_one(data):
+    pos = _ChessPos()
+    p = 0
+    n_moves, p = _dec_varint(data, p)
+    seen = 0
+    out = bytearray()
+    while p < len(data):
+        t = data[p]; p += 1
+        if t == 0:
+            lit, p = _dec_str(data, p)
+            out += lit
+        elif t == 1:
+            san, p = _decode_san_record(pos, data, p)
+            out += san
+            seen += 1
+        else:
+            raise ValueError("registre movetext desconegut")
+    if seen != n_moves:
+        raise ValueError("nombre de moviments no coincideix")
+    return bytes(out)
+
+
+def _encode_all_movetexts_chess(movetexts):
+    out = bytearray()
+    for m in movetexts:
+        enc = _encode_movetext_chess_one(m)
+        if enc is None:
+            out.append(0)
+            out += _enc_str(m)
+        else:
+            out.append(1)
+            out += _enc_str(enc)
+    return bytes(out)
+
+
+def _decode_all_movetexts_chess(stream, n_games):
+    out = []
+    p = 0
+    for _ in range(n_games):
+        t = stream[p]; p += 1
+        payload, p = _dec_str(stream, p)
+        if t == 0:
+            out.append(payload)
+        elif t == 1:
+            out.append(_decode_movetext_chess_one(payload))
+        else:
+            raise ValueError("flag movetext chess desconegut")
+    if p != len(stream):
+        raise ValueError("sobren bytes al stream de movetext")
+    return out
+
+
+def compress_chess(data):
+    parsed = _try_split_pgn(data)
+    if parsed is None:
+        return b'\x00' + compress_arith_bytes(data)
+
+    headers, movetexts = parsed
+    sem_stream = _encode_all_headers(headers)
+    mov_stream = _encode_all_movetexts_chess(movetexts)
+
+    enc_sem = compress_arith_bytes(sem_stream)
+    enc_mov = compress_arith_bytes(mov_stream)
+
+    return (b'\x03'
+            + bytes([_EOL_CRLF if _LAST_SPLIT_EOL == b'\r\n' else _EOL_LF])
+            + _enc_varint(len(headers))
+            + _enc_varint(len(enc_sem))
+            + enc_sem
+            + enc_mov)
+
+
+def decompress_chess(payload):
+    flag = payload[0]
+    if flag == 0x00:
+        return decompress_arith_bytes(payload[1:])
+    if flag == 0x03:
+        global _LAST_SPLIT_EOL
+        _LAST_SPLIT_EOL = b'\r\n' if payload[1] == _EOL_CRLF else b'\n'
+        pos = 2
+        n_games, pos = _dec_varint(payload, pos)
+        len_sem, pos = _dec_varint(payload, pos)
+        enc_sem = payload[pos:pos + len_sem]; pos += len_sem
+        enc_mov = payload[pos:]
+        sem_stream = decompress_arith_bytes(enc_sem)
+        mov_stream = decompress_arith_bytes(enc_mov)
+        headers   = _decode_all_headers(sem_stream, n_games)
+        movetexts = _decode_all_movetexts_chess(mov_stream, n_games)
+        return _assemble_pgn(headers, movetexts)
+    raise ValueError("flag mode chess desconegut: %d" % flag)
+
+
 MODE_FUNCS = {
     MODE_IDENTITY   : (compress_identity,    decompress_identity),
     MODE_ARITH_BYTES: (compress_arith_bytes, decompress_arith_bytes),
     MODE_SPLIT      : (compress_split,       decompress_split),
     MODE_SEMANTIC   : (compress_semantic,    decompress_semantic),
+    MODE_CHESS      : (compress_chess,       decompress_chess),
 }
 
 
